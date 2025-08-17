@@ -8,15 +8,18 @@ import ndjson from 'ndjson'
 import nodemailer from 'nodemailer'
 import schedule from 'node-schedule'
 
-const clientId = "9606bb7a-1e28-4249-bd79-78250232a10b" //my client id mb: 20250804
+// Epic FHIR Configuration
+const clientId = "9606bb7a-1e28-4249-bd79-78250232a10b"
 const tokenEndpoint = "https://fhir.epic.com/interconnect-fhir-oauth/oauth2/token"
 const fhirBaseUrl = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
 const groupId = "e3iabhmS8rsueyz7vaimuiaSmfGvi.QwjVXJANlPOgR83"
 
 
-const createJWT = async (payload)=>{
-  const privateKey = fs.readFileSync('privatekey.pem', 'utf8');
-  const key = await jose.JWK.asKey(privateKey, 'pem');
+
+// JWT Authentication
+const createJWT = async (payload) => {
+  const keys = JSON.parse(fs.readFileSync('keys.json', 'utf8'))
+  const key = await jose.JWK.asKey(keys.keys[0], 'json')
   return jose.JWS.createSign({compact: true, fields: {"typ": "jwt", "alg": "RS256"}}, key)
     .update(JSON.stringify(payload))
     .final()
@@ -34,18 +37,21 @@ const makeTokenRequest = async () => {
     "jti": randomUUID(),
     "exp": generateExpiry(4),
   })
+  
   const formParams = new URLSearchParams()
   formParams.set('grant_type', 'client_credentials')
   formParams.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer')
   formParams.set('client_assertion', jwt)
+  
   const tokenResponse = await axios.post(tokenEndpoint, formParams, {
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
-    }})
+    }
+  })
   return tokenResponse.data
 }
 
-
+// FHIR Bulk Data Operations
 const kickOffBulkDataExport = async (accessToken) => {
   const bulkKickoffResponse = await axios.get(`${fhirBaseUrl}/Group/${groupId}/$export`, {
     params: {
@@ -61,38 +67,36 @@ const kickOffBulkDataExport = async (accessToken) => {
   return bulkKickoffResponse.headers.get('Content-Location')
 }
 
-const pollAndWaitForExport = async (url, accessToken, secsToWait=10) => {
+const pollAndWaitForExport = async (url, accessToken, secsToWait = 10) => {
   try {
     const response = await axios.get(url, {
       headers: {
         Authorization: `Bearer ${accessToken}`
       }
     })
-    const progress = response.headers.get("X-Progress")
-    const status = response.status
-    const data = response.data
-    console.log({url, status, progress, data})
-    if (response.status == 200) {
+    
+    if (response.status === 200) {
       return response.data
     }
   } catch (e) {
-    console.log("Error trying to get Bulk Request. Retrying...");
+    console.log("Error polling bulk export. Retrying...")
   }
-  console.log(`[${new Date().toISOString()}] waiting ${secsToWait} secs`)
+  
+  console.log(`[${new Date().toISOString()}] Waiting ${secsToWait} seconds before retry...`)
   await new Promise(resolve => setTimeout(resolve, secsToWait * 1000))
   return await pollAndWaitForExport(url, accessToken, secsToWait)
 }
 
 const processBulkResponse = async (bundleResponse, accessToken, type, fn) => {
-  const filteredOutputs = bundleResponse.output?.filter((output)=>output.type == type)
-  const promises = filteredOutputs?.map((output)=>{
+  const filteredOutputs = bundleResponse.output?.filter((output) => output.type === type)
+  const promises = filteredOutputs?.map((output) => {
     const url = output.url
-    return new Promise((resolve)=>{
+    return new Promise((resolve) => {
       const stream = hyperquest(url, {
         headers: {
           Authorization: `Bearer ${accessToken}`
         }
-      });
+      })
       
       stream.pipe(ndjson.parse()).on('data', fn)
       stream.on('error', resolve)
@@ -102,16 +106,20 @@ const processBulkResponse = async (bundleResponse, accessToken, type, fn) => {
   return await Promise.all(promises)
 }
 
+// Lab Result Analysis
 const checkIfObservationIsNormal = (resource) => {
   const value = resource?.valueQuantity?.value
   if (!resource?.referenceRange) {
     return {isNormal: false, reason: "No reference range found"}
   }
+  
   const referenceRangeLow = resource?.referenceRange?.[0]?.low?.value
   const referenceRangeHigh = resource?.referenceRange?.[0]?.high?.value
+  
   if (!value || !referenceRangeLow || !referenceRangeHigh) {
     return {isNormal: false, reason: "Incomplete data"}
   }
+  
   if (value >= referenceRangeLow && value <= referenceRangeHigh) {
     return {isNormal: true, reason: "Within reference range"}
   } else {
@@ -119,148 +127,188 @@ const checkIfObservationIsNormal = (resource) => {
   }
 }
 
+// Email Service
 const sendEmail = async (body) => {
   const transporter = nodemailer.createTransport({
     host: 'smtp.ethereal.email',
     port: 587,
-    secure: false, // true for 465, false for other ports
+    secure: false,
     auth: {
-        user: process.env.EMAIL_USER || 'your-ethereal-email@ethereal.email',
-        pass: process.env.EMAIL_PASS || 'your-ethereal-password'
+      user: process.env.EMAIL_USER || 'your-ethereal-email@ethereal.email',
+      pass: process.env.EMAIL_PASS || 'your-ethereal-password'
     }
-  });
+  })
   return await transporter.sendMail(body)
-  
 }
 
+// Main Application Logic
 const main = async () => {
-  console.log("Running main function")
-  const tokenResponse = await makeTokenRequest()
-  const accessToken = tokenResponse.access_token
-  const contentLocation = await kickOffBulkDataExport(accessToken)
-  const bulkDataResponse = await pollAndWaitForExport(contentLocation, accessToken, 30)
-  // const bulkDataResponse = {
-  //   "transactionTime": "2024-05-09T09:54:22Z",
-  //   "request": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/Group/e3iabhmS8rsueyz7vaimuiaSmfGvi.QwjVXJANlPOgR83/$export?_type=patient,observation&_typeFilter=Observation%3Fcategory%3Dlaboratory",
-  //   "requiresAccessToken": "true",
-  //   "output": [
-  //       {
-  //           "type": "Patient",
-  //           "url": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/BulkRequest/000000000009FCC95C5E7D8D13A45743/eIBRQ6DcasyQ1SbsDlWGzIQ3"
-  //       },
-  //       {
-  //           "type": "Observation",
-  //           "url": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/BulkRequest/000000000009FCC95C5E7D8D13A45743/eqnfiYzX269P7lwrbi4RnUw3"
-  //       }
-  //   ],
-  //   "error": []
-  // }
-
-  const patients = {}
-  await processBulkResponse(bulkDataResponse, accessToken, 'Patient', (resource)=>{
-    patients[`Patient/${resource.id}`] = resource
-  })
-
-  let message = `Results of lab tests in sandbox (Date: ${new Date().toISOString()})\n`
-  let abnormalObservations = ``
-  let normalObservations = ``
-  await processBulkResponse(bulkDataResponse, accessToken, 'Observation', (resource)=>{
-    const {isNormal, reason} = checkIfObservationIsNormal(resource)
-    const patient = patients[resource.subject.reference]
-    if (isNormal) {
-      normalObservations += `${resource.code.text}: ${resource?.valueQuantity?.value}. Reason: ${reason}, Patient Name: ${patient?.name?.[0]?.text}, Patient ID: ${patient?.id}\n`
-    } else {
-      abnormalObservations += `${resource.code.text}. Reason: ${reason}. Patient Name: ${patient?.name?.[0]?.text}, Patient ID: ${patient?.id}\n`
-    }
-  })
-
-  message += 'Abnormal Observations:\n' + abnormalObservations + '\n\n'
-  message += 'Normal Observations:\n' + normalObservations
-
-  console.log(message)
-
-  // Generate HTML report
-  const htmlContent = `
+  console.log("🚀 Starting Epic FHIR Lab Report Processor...")
+  
+  try {
+    // Step 1: Authenticate with Epic
+    console.log("🔐 Authenticating with Epic FHIR...")
+    const tokenResponse = await makeTokenRequest()
+    const accessToken = tokenResponse.access_token
+    console.log("✅ Authentication successful")
+    
+    // Step 2: Initiate bulk data export
+    console.log("📊 Initiating bulk data export...")
+    const contentLocation = await kickOffBulkDataExport(accessToken)
+    const bulkDataResponse = await pollAndWaitForExport(contentLocation, accessToken, 30)
+    console.log("✅ Bulk data export completed")
+    
+    // Step 3: Process patient data
+    console.log("👥 Processing patient data...")
+    const patients = {}
+    await processBulkResponse(bulkDataResponse, accessToken, 'Patient', (resource) => {
+      patients[`Patient/${resource.id}`] = resource
+    })
+    console.log(`✅ Processed ${Object.keys(patients).length} patients`)
+    
+    // Step 4: Analyze lab observations
+    console.log("🔬 Analyzing lab observations...")
+    let abnormalObservations = ``
+    let normalObservations = ``
+    
+    await processBulkResponse(bulkDataResponse, accessToken, 'Observation', (resource) => {
+      const {isNormal, reason} = checkIfObservationIsNormal(resource)
+      const patient = patients[resource.subject.reference]
+      
+      if (isNormal) {
+        normalObservations += `${resource.code.text}: ${resource?.valueQuantity?.value}. Reason: ${reason}, Patient Name: ${patient?.name?.[0]?.text}, Patient ID: ${patient?.id}\n`
+      } else {
+        abnormalObservations += `${resource.code.text}. Reason: ${reason}. Patient Name: ${patient?.name?.[0]?.text}, Patient ID: ${patient?.id}\n`
+      }
+    })
+    
+    const abnormalCount = abnormalObservations.split('\n').filter(line => line.trim()).length
+    const normalCount = normalObservations.split('\n').filter(line => line.trim()).length
+    
+    console.log(`✅ Found ${abnormalCount} abnormal and ${normalCount} normal observations`)
+    
+    // Step 5: Generate HTML report
+    console.log("📄 Generating HTML report...")
+    const htmlContent = `
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Lab Report - ${new Date().toDateString()}</title>
+    <title>Epic FHIR Lab Report - ${new Date().toDateString()}</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; text-align: center; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
-        .section { margin: 20px 0; }
-        .section h2 { color: #34495e; border-left: 4px solid #3498db; padding-left: 15px; }
-        .observation { margin: 10px 0; padding: 10px; border-radius: 5px; }
-        .abnormal { background-color: #ffebee; border-left: 4px solid #f44336; }
-        .normal { background-color: #e8f5e8; border-left: 4px solid #4caf50; }
-        .patient-info { font-weight: bold; color: #2c3e50; }
-        .reason { font-style: italic; color: #7f8c8d; }
-        .value { font-weight: bold; color: #e74c3c; }
-        .timestamp { text-align: center; color: #7f8c8d; font-size: 14px; margin-top: 20px; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background-color: #f8f9fa; }
+        .container { max-width: 1000px; margin: 20px auto; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }
+        h1 { margin: 0; font-size: 2.5em; font-weight: 300; }
+        .subtitle { margin: 10px 0 0 0; opacity: 0.9; font-weight: 300; }
+        .content { padding: 40px; }
+        .section { margin: 30px 0; }
+        .section h2 { color: #2c3e50; border-bottom: 2px solid #e9ecef; padding-bottom: 10px; margin-bottom: 20px; }
+        .observation { margin: 15px 0; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+        .abnormal { background-color: #fff5f5; border-left: 4px solid #e53e3e; }
+        .normal { background-color: #f0fff4; border-left: 4px solid #38a169; }
+        .patient-info { font-weight: 600; color: #2d3748; font-size: 1.1em; margin-bottom: 8px; }
+        .reason { color: #718096; font-style: italic; margin-bottom: 8px; }
+        .patient-details { color: #4a5568; font-size: 0.9em; }
+        .stats { display: flex; justify-content: space-around; margin: 30px 0; text-align: center; }
+        .stat { background: #f7fafc; padding: 20px; border-radius: 8px; flex: 1; margin: 0 10px; }
+        .stat-number { font-size: 2em; font-weight: bold; color: #2d3748; }
+        .stat-label { color: #718096; margin-top: 5px; }
+        .footer { background: #f7fafc; padding: 20px; text-align: center; color: #718096; border-top: 1px solid #e2e8f0; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🏥 Lab Report Analysis</h1>
-        <div class="timestamp">Generated on: ${new Date().toISOString()}</div>
+        <div class="header">
+            <h1>🏥 Epic FHIR Lab Report</h1>
+            <p class="subtitle">Automated Lab Result Analysis</p>
+        </div>
         
-        <div class="section">
-            <h2>🚨 Abnormal Observations</h2>
-            ${abnormalObservations.split('\n').filter(line => line.trim()).map(obs => {
-                const match = obs.match(/(.*?)\. Reason: (.*?)\. Patient Name: (.*?), Patient ID: (.*)/);
-                if (match) {
-                    const [, test, reason, patientName, patientId] = match;
-                    return `<div class="observation abnormal">
-                        <div class="patient-info">${test}</div>
-                        <div class="reason">Reason: ${reason}</div>
-                        <div>Patient: ${patientName} (ID: ${patientId})</div>
-                    </div>`;
-                }
-                return `<div class="observation abnormal">${obs}</div>`;
-            }).join('')}
+        <div class="content">
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-number">${abnormalCount}</div>
+                    <div class="stat-label">Abnormal Results</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">${normalCount}</div>
+                    <div class="stat-label">Normal Results</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">${Object.keys(patients).length}</div>
+                    <div class="stat-label">Patients</div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>🚨 Abnormal Observations</h2>
+                ${abnormalObservations.split('\n').filter(line => line.trim()).map(obs => {
+                    const match = obs.match(/(.*?)\. Reason: (.*?)\. Patient Name: (.*?), Patient ID: (.*)/);
+                    if (match) {
+                        const [, test, reason, patientName, patientId] = match;
+                        return `<div class="observation abnormal">
+                            <div class="patient-info">${test}</div>
+                            <div class="reason">Reason: ${reason}</div>
+                            <div class="patient-details">Patient: ${patientName} (ID: ${patientId})</div>
+                        </div>`;
+                    }
+                    return `<div class="observation abnormal">${obs}</div>`;
+                }).join('')}
+            </div>
+            
+            <div class="section">
+                <h2>✅ Normal Observations</h2>
+                ${normalObservations.split('\n').filter(line => line.trim()).map(obs => {
+                    const match = obs.match(/(.*?): (.*?)\. Reason: (.*?)\. Patient Name: (.*?), Patient ID: (.*)/);
+                    if (match) {
+                        const [, test, value, reason, patientName, patientId] = match;
+                        return `<div class="observation normal">
+                            <div class="patient-info">${test}: <span style="color: #38a169; font-weight: 600;">${value}</span></div>
+                            <div class="reason">Reason: ${reason}</div>
+                            <div class="patient-details">Patient: ${patientName} (ID: ${patientId})</div>
+                        </div>`;
+                    }
+                    return `<div class="observation normal">${obs}</div>`;
+                }).join('')}
+            </div>
         </div>
-        <!--
-        <div class="section">
-            <h2>✅ Normal Observations</h2>
-            ${normalObservations.split('\n').filter(line => line.trim()).map(obs => {
-                const match = obs.match(/(.*?): (.*?)\. Reason: (.*?)\. Patient Name: (.*?), Patient ID: (.*)/);
-                if (match) {
-                    const [, test, value, reason, patientName, patientId] = match;
-                    return `<div class="observation normal">
-                        <div class="patient-info">${test}: <span class="value">${value}</span></div>
-                        <div class="reason">Reason: ${reason}</div>
-                        <div>Patient: ${patientName} (ID: ${patientId})</div>
-                    </div>`;
-                }
-                return `<div class="observation normal">${obs}</div>`;
-            }).join('')}
-        </div>
-        -->
-        <div class="timestamp">
-            <p>This report was automatically generated by the Epic FHIR Lab Report Processor.</p>
+        
+        <div class="footer">
+            <p>Generated on: ${new Date().toLocaleString()}</p>
+            <p>Powered by Epic FHIR Integration</p>
         </div>
     </div>
 </body>
-</html>`;
+</html>`
 
-  // Save HTML report to file
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `lab-reports-${timestamp}.html`;
-  
-  fs.writeFileSync(filename, htmlContent, 'utf8');
-  console.log(`📄 HTML lab report saved to: ${filename}`);
-
-  // Send email with HTML report
-  const emailAck = await sendEmail({
-    from: '"Lab Report System" <eliane.gleason4@ethereal.email>',
-    to: "eliane.gleason4@ethereal.email", // Send to the same Ethereal account
-    subject: `Lab Reports on ${new Date().toDateString()} 🔥`,
-    html: htmlContent,
-  })
-  console.log("📧 Email sent successfully!")
-  console.log("✅ Lab report processing completed successfully!")
+    // Step 6: Save report to file
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `epic-lab-report-${timestamp}.html`
+    fs.writeFileSync(filename, htmlContent, 'utf8')
+    console.log(`📄 Report saved to: ${filename}`)
+    
+    // Step 7: Send email notification
+    console.log("📧 Sending email notification...")
+    const emailAck = await sendEmail({
+      from: '"Epic FHIR Lab Processor" <eliane.gleason4@ethereal.email>',
+      to: "eliane.gleason4@ethereal.email",
+      subject: `Epic FHIR Lab Report - ${abnormalCount} Abnormal Results - ${new Date().toDateString()}`,
+      html: htmlContent,
+    })
+    console.log("✅ Email sent successfully!")
+    
+    console.log("🎉 Lab report processing completed successfully!")
+    
+  } catch (error) {
+    console.error("❌ Error in main process:", error.message)
+    process.exit(1)
+  }
 }
-main()
-// schedule.scheduleJob('*/5 * * * *', main)
+
+// Run the application
+if (process.argv.includes('--schedule')) {
+  console.log("⏰ Scheduling job to run every 5 minutes...")
+  schedule.scheduleJob('*/5 * * * *', main)
+} else {
+  main()
+}
